@@ -1,6 +1,8 @@
 import time
 import pandas as pd
 import re
+import os
+import csv
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -9,26 +11,86 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from multiprocessing import Pool
 import random
+import openpyxl
 
-def create_driver():
+# Define column order globally
+COLUMN_ORDER = [
+    "Product Url",
+    "Product Name",
+    "Description",
+    "MRP",
+    "Discounted Price",
+    "Discount",
+    "Highlights",
+    "Images",
+    "Variants",
+    "Current Variant"
+]
+
+def create_driver(max_retries=3):
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless")  # Run in headless mode
-    options.add_argument("--log-level=3")  # Suppress logs
+    options.add_argument("--headless")
+    options.add_argument("--log-level=3")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36")
-    # Disable images to speed up page loads
     options.add_argument("--blink-settings=imagesEnabled=false")
-    service = Service(ChromeDriverManager().install())
-    service.log_path = "nul"  # On Windows, "nul" discards logs
-    driver = webdriver.Chrome(service=service, options=options)
-    return driver
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+
+    for attempt in range(max_retries):
+        try:
+            service = Service(ChromeDriverManager().install())
+            service.log_path = "nul"
+            time.sleep(1)
+            driver = webdriver.Chrome(service=service, options=options)
+            return driver
+        except Exception as e:
+            print(f"Failed to create driver (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2)
+    raise Exception("Failed to create Chrome driver after maximum retries")
 
 def clean_image_url(image_url):
     match = re.match(r"(https://onemg\.gumlet\.io/)(?:[^/]+/)*([^/]+\.(?:jpg|png|jpeg|gif))", image_url)
     if match:
-        base_url = match.group(1)  
-        file_name = match.group(2) 
+        base_url = match.group(1)
+        file_name = match.group(2)
         return f"{base_url}{file_name}"
     return image_url
+
+def append_to_temp_csv(data, temp_filename):
+    """Append a single row of data to a temporary CSV file."""
+    file_exists = os.path.isfile(temp_filename)
+    with open(temp_filename, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=COLUMN_ORDER)
+        if not file_exists:
+            writer.writeheader()  # Write header if file doesn't exist
+        # Convert lists and dictionaries to strings for CSV compatibility
+        row_data = {}
+        for col in COLUMN_ORDER:
+            value = data.get(col, "")
+            if col in ["Highlights", "Images", "Variants", "Current Variant"]:
+                value = str(value)
+            row_data[col] = value
+        writer.writerow(row_data)
+    print(f"Appended data for {data['Product Url']} to {temp_filename}")
+
+def combine_temp_files(temp_files, final_filename, sheet_name):
+    """Combine all temporary CSV files into a single Excel file."""
+    all_data = []
+    for temp_file in temp_files:
+        if os.path.exists(temp_file):
+            df = pd.read_csv(temp_file)
+            all_data.append(df)
+            # os.remove(temp_file)
+    if all_data:
+        combined_df = pd.concat(all_data, ignore_index=True)
+        with pd.ExcelWriter(final_filename, engine='openpyxl') as writer:
+            combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
+        print(f"Combined all data into {final_filename}")
+    else:
+        print("No data to combine into Excel file.")
 
 def extract_product_links(category_url):
     driver = create_driver()
@@ -61,7 +123,8 @@ def extract_product_links(category_url):
     finally:
         driver.quit()
 
-def scrape_product(product_url):
+def scrape_product(args):
+    product_url, description, temp_filename, sheet_name = args
     driver = create_driver()
     try:
         driver.get(product_url)
@@ -158,41 +221,29 @@ def scrape_product(product_url):
 
         except Exception as e:
             print(f"Error extracting price details for {product_url}: {e}")
-        
-        # Extract variants
+
         variants = []
         current_variant = []
         try:
-            # Find all variant containers (one for each variant type, e.g., "Potency", "Pack Size")
             variants_containers = product_data.find_elements(By.CLASS_NAME, "OtcVariants__container___2Y3D2")
-
             for variant_container in variants_containers:
-                # Extract variant name (e.g., "Potency")
                 header = variant_container.find_element(By.CLASS_NAME, "OtcVariants__header___2q6Sa")
                 variant_name = header.find_element(By.TAG_NAME, "h3").text
                 variant_name = re.sub(r'\s*\(\d+\)', '', variant_name).strip()
                 curr_container = {variant_name: []}
 
-                # Find all variant value containers (nested inside an extra <div class="">)
                 variant_divs = variant_container.find_elements(By.CLASS_NAME, "OtcVariants__variant-div___2l321")
-
-                # Extract all variant values
                 variant_values = []
                 for variant_div in variant_divs:
                     variant_item = variant_div.find_element(By.CLASS_NAME, "OtcVariantsItem__container___2ldJL")
-                    # Extract the text from the inner variant-text div to avoid extra whitespace/comments
                     variant_text = variant_item.find_element(By.CLASS_NAME, "OtcVariantsItem__variant-text___1Grsz").text.strip()
                     variant_values.append(variant_text)
 
-                    # Check if this is the selected variant
                     if "OtcVariantsItem__selected___1wDpJ" in variant_item.get_attribute("class"):
                         selected_value = variant_text
                         current_variant.append({variant_name: selected_value})
 
-                # Store the variant values in the current container
                 curr_container[variant_name] = variant_values
-
-                # Append the current container to the variants list
                 variants.append(curr_container)
 
         except Exception as e:
@@ -202,9 +253,10 @@ def scrape_product(product_url):
 
         time.sleep(random.uniform(0.5, 1.5))
 
-        return {
+        product_details = {
             "Product Url": product_url,
             "Product Name": product_name,
+            "Description": description if description else "N/A",
             "MRP": mrp,
             "Discounted Price": price,
             "Discount": discount,
@@ -213,11 +265,16 @@ def scrape_product(product_url):
             "Variants": variants,
             "Current Variant": current_variant
         }
+        append_to_temp_csv(product_details, temp_filename)
+
+        return product_details
+
     except Exception as e:
         print(f"Error scraping product {product_url}: {e}")
-        return {
+        product_details = {
             "Product Url": product_url,
             "Product Name": "Error",
+            "Description": description if description else "N/A",
             "MRP": "N/A",
             "Discounted Price": "N/A",
             "Discount": "N/A",
@@ -226,6 +283,9 @@ def scrape_product(product_url):
             "Variants": [],
             "Current Variant": []
         }
+        append_to_temp_csv(product_details, temp_filename)
+        return product_details
+
     finally:
         driver.quit()
 
@@ -256,7 +316,7 @@ def main(categories):
                     break
 
                 next_button.click()
-                time.sleep(2)  # Reduced delay
+                time.sleep(2)
                 current_url = driver.current_url
                 page_number += 1
             except Exception as e:
@@ -273,89 +333,49 @@ def main(categories):
                 df.to_excel(writer, sheet_name=category, index=False)
 
 def main_2(categories, num_processes=4):
-    detailed_data = {}
-
     for category in categories:
         category_name = category[0]
         print(f"Scraping product details for category: {category_name}")
 
         try:
-            df = pd.read_excel(f"product_links.xlsx", sheet_name=category_name)
-            product_urls = df["Product Link"].tolist()  # Adjust as needed
-            descriptions = df["Description"].tolist()  # Get descriptions
+            df = pd.read_excel("product_links.xlsx", sheet_name=category_name)
+            product_urls = df["Product Link"].tolist()
+            descriptions = df["Description"].tolist()
             print(f"Found {len(product_urls)} product URLs for {category_name}")
         except Exception as e:
             print(f"Error reading product links for {category_name}: {e}")
             continue
 
+        # Create a list to store temporary CSV filenames
+        temp_files = []
+        filename = f"{category_name}.xlsx"
+        # Distribute URLs across processes
+        chunk_size = len(product_urls) // num_processes if num_processes > 0 else len(product_urls)
+        chunks = [product_urls[i:i + chunk_size] for i in range(0, len(product_urls), chunk_size)]
+        desc_chunks = [descriptions[i:i + chunk_size] for i in range(0, len(descriptions), chunk_size)]
+
+        # Create arguments for each process
+        args = []
+        for i, (url_chunk, desc_chunk) in enumerate(zip(chunks, desc_chunks)):
+            temp_filename = f"temp_{category_name}_{i}.csv"
+            temp_files.append(temp_filename)
+            for url, desc in zip(url_chunk, desc_chunk):
+                args.append((url, desc, temp_filename, category_name))
+
         # Use multiprocessing to scrape products in parallel
         with Pool(processes=num_processes) as pool:
-            product_details_list = pool.map(scrape_product, product_urls)
-        
-        for i, product_details in enumerate(product_details_list):
-            product_details["Description"] = descriptions[i] if i < len(descriptions) else "N/A"
+            pool.map(scrape_product, args)
 
-        column_order = [
-            "Product Url",
-            "Product Name",
-            "Description",
-            "MRP",
-            "Discounted Price",
-            "Discount",
-            "Highlights",
-            "Images",
-            "Variants",
-            "Current Variant"
-        ]
-
-        # Create DataFrame with specified column order
-        detailed_data[category_name] = pd.DataFrame(product_details_list)[column_order]
-
-    with pd.ExcelWriter(f"{category_name}.xlsx") as writer:
-        for category, df in detailed_data.items():
-            df.to_excel(writer, sheet_name=category, index=False)
+        # Combine temporary CSV files into a single Excel file
+        combine_temp_files(temp_files, filename, category_name)
 
     print(f"Finished scraping product details. Saved to {category_name}.xlsx")
 
 if __name__ == "__main__":
     categories = [
-        ['Diabetes', 'https://www.1mg.com/categories/diabetes-1'],
-        # ['Vitamins & Nutrition', 'https://www.1mg.com/categories/vitamins-nutrition-5'],
-        # ['Nutritional Drinks', 'https://www.1mg.com/categories/nutritional-drinks-196'],
-        # ['Pet Care', 'https://www.1mg.com/categories/pet-care-612'],
-        # ['Sexual Wellness', 'https://www.1mg.com/categories/sexual-wellness-22'],
-        # ['Stomach Care', 'https://www.1mg.com/categories/stomach-care-30'],
-        # ['Fitness Supplements', 'https://www.1mg.com/categories/fitness-supplements-7'],
-        # ['Pain Relief', 'https://www.1mg.com/categories/pain-relief-32'],
-        # ['Herbal Juices', 'https://www.1mg.com/categories/herbal-juice-174'],
-        # ['Healthy Snacks', 'https://www.1mg.com/categories/healthy-snacks-623'],
-        # ['Immunity Boosters', 'https://www.1mg.com/categories/immunity-boosters-142'],
-        # ['Covid Essentials', 'https://www.1mg.com/categories/coronavirus-prevention-925'],
-        # ['Personal Care', 'https://www.1mg.com/categories/personal-care-products-18'],
-        # ['Supports & Braces', 'https://www.1mg.com/categories/supports-braces-15'],
-        # ['Hair Care', 'https://www.1mg.com/categories/hair-skin-care-event-hair-care-3305'],
-        # ['The Ayurveda Store', 'https://www.1mg.com/categories/ayurveda-products-45'],
-        # ['Winter Care', 'https://www.1mg.com/categories/winter-care-essentials-3362'],
-        # ['Elderly Care', 'https://www.1mg.com/categories/elderly-care-21'],
-        # ['Rehydration Beverages', 'https://www.1mg.com/categories/rehydration-beverages-382'],
-        # ['Health Conditions', 'https://www.1mg.com/categories/health-conditions-28'],
-        # ['First Aid', 'https://www.1mg.com/categories/first-aid-36'],
-        # ['Devices in Healthcare', 'https://www.1mg.com/categories/devices-healthcare-1288'],
-        # ['Cold, Cough & Fever', 'https://www.1mg.com/categories/cold-cough-fever-37'],
-        # ['Baby Care', 'https://www.1mg.com/categories/baby-care-24'],
-        # ['Anti-Pollution', 'https://www.1mg.com/categories/anti-pollution-237'],
-        # ['Fever & Headache', 'http://1mg.com/categories/health-conditions/fever-38'],
-        # ['Skin Infection', 'https://www.1mg.com/categories/skin-infection-1184'],
-        # ['Featured', 'https://www.1mg.com/categories/featured-128'],
-        # ['Eye & Ear Care', 'https://www.1mg.com/categories/health-conditions/eye-ear-care-3063'],
-        # ['Monitoring Devices', 'https://www.1mg.com/categories/monitoring-devices-1869'],
-        # ['Healthcare Devices', 'https://www.1mg.com/categories/medical-devices-12'],
-        # ['Tata Neu', 'https://www.1mg.com/categories/tata-neu-1305'],
-        # ['Homeopathy','https://www.1mg.com/categories/homeopathy-57'],
-        # ['Face Care', 'https://www.1mg.com/categories/hair-skin-care-event-face-care-3306'],
-        # ['Body Care', 'https://www.1mg.com/categories/hair-skin-care-event-body-care-3307']
+        ['Pet Care', 'https://www.1mg.com/categories/pet-care-612'],
+        # Add other categories as needed
     ]
 
-    
     # main(categories)  # Uncomment to extract product links
     main_2(categories, num_processes=4)
