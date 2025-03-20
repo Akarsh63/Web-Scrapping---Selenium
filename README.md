@@ -1,1 +1,1 @@
-## pip install selenium pandas webdriver-manager openpyxl
+# pip install selenium pandas webdriver-manager openpyxl
