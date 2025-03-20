@@ -10,7 +10,9 @@ Follow these steps to set up and run the project:
 
 ```sh
 venv/Scripts/activate
+```sh
 
 pip install selenium pandas webdriver-manager openpyxl
+```sh
 
 python tata_1mg.py
