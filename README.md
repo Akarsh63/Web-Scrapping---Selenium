@@ -8,7 +8,7 @@ Follow these steps to set up and run the project:
    ```sh
    python -m venv venv
 
-
+```sh
 venv/Scripts/activate
 
 pip install selenium pandas webdriver-manager openpyxl
